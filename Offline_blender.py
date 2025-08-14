@@ -1,24 +1,28 @@
 # offline_tuner.py
 # ============================================================
-# 🧪 MLB HR / TB≥2 / RBI≥2 Offline Tuner (Cloud-Safe, No Sliders/Plots)
-# - Inputs: Event-level CSV/Parquet (must include hr_outcome)
-# - Optional: Batter & Pitcher season profiles (CSV) for weather-free overlay
-# - Fixed: 5 folds, Hits@30 as primary metric
-# - Models: XGB/LGB/CB (early stop) → LR meta → Isotonic + temp tuning
-# - Tuners: Overlay exponents + Final blend weights (auto-run; cloud-safe sizes)
-# - Output: Metrics and best weights JSON (to port into prediction app)
+# 🧪 MLB HR/TB/RBI Offline Tuner (Streamlit Cloud–friendly)
+# - Inputs: Event-level data (+ hr_outcome), Season batter profile, Season pitcher profile
+# - No TODAY file, No weather dependence
+# - Base meta-ensemble (XGB/LGB/CB → LR) with early stopping
+# - Isotonic calibration + top-K temp tuning (K=30 fixed)
+# - Weather-free overlay (batter/pitcher/platoon/park) from profiles
+# - Auto-derive TB≥2 (tb_ge_2) and RBI≥2 (rbi_ge_2) if missing
+# - Multiplier Tuner (overlay exponents) — per target
+# - Blended Tuner (prob + overlay + ranker + RRF – penalty) — per target
+# - 5 folds, no plots, tuned for Streamlit Cloud memory/CPU
 # ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import gc, time, json
+import json, time, gc
 from datetime import timedelta
+from collections import defaultdict
 
-from sklearn.metrics import roc_auc_score, log_loss
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import roc_auc_score, log_loss
 
 import xgboost as xgb
 import lightgbm as lgb
@@ -26,25 +30,40 @@ import catboost as cb
 
 from scipy.special import logit, expit
 
-# ---------- Fixed knobs (per your request) ----------
-TOPK_EVAL = 30
-N_SPLITS = 5
-MULT_SAMPLES  = 2000   # cloud-safe; raise locally later if desired
-BLEND_SAMPLES = 6000   # cloud-safe; raise locally later if desired
+# ============= UI HEADER =============
+st.set_page_config(page_title="🧪 Offline Tuner (HR / TB≥2 / RBI≥2)", layout="wide")
+st.title("🧪 Offline Tuner — HR / TB≥2 / RBI≥2 (Cloud-friendly)")
 
-st.set_page_config(page_title="🧪 MLB Offline Tuner (HR/TB/RBI)", layout="wide")
-st.title("🧪 MLB Offline Tuner — HR, TB≥2, RBI≥2 (Cloud-safe)")
+# ============= CONSTANTS (Cloud-safe) =============
+TOPK = 30
+N_FOLDS = 5
+SEEDS = [42, 101, 202, 404]
+SAMPLES_MULT = 4000   # overlay exponent search
+SAMPLES_BLEND = 6000  # final blend search
 
-DEFAULT_BLEND = dict(w_prob=0.30, w_overlay=0.20, w_ranker=0.20, w_rrf=0.10, w_penalty=0.20)
-DEFAULT_MULT  = dict(a_batter=0.80, b_pitcher=0.80, c_platoon=0.60, d_park=0.40)
+# ============= SESSION DEFAULTS =============
+DEFAULT_BLEND = dict(
+    w_prob=0.30,
+    w_overlay=0.20,
+    w_ranker=0.20,
+    w_rrf=0.10,
+    w_penalty=0.20,
+)
+DEFAULT_MULT = dict(
+    a_batter=0.80,
+    b_pitcher=0.80,
+    c_platoon=0.60,
+    d_park=0.40,
+)
+if "best_by_target" not in st.session_state:
+    st.session_state.best_by_target = {
+        "HR":   {"blend": DEFAULT_BLEND.copy(), "mult": DEFAULT_MULT.copy()},
+        "TB2":  {"blend": DEFAULT_BLEND.copy(), "mult": DEFAULT_MULT.copy()},
+        "RBI2": {"blend": DEFAULT_BLEND.copy(), "mult": DEFAULT_MULT.copy()},
+    }
 
-if "saved_best_blend" not in st.session_state:
-    st.session_state.saved_best_blend = DEFAULT_BLEND.copy()
-if "saved_best_mult" not in st.session_state:
-    st.session_state.saved_best_mult  = DEFAULT_MULT.copy()
-
-# ---------- Helpers ----------
-@st.cache_data(show_spinner=False, max_entries=3)
+# ============= HELPERS =============
+@st.cache_data(show_spinner=False, max_entries=4)
 def _read_any(path):
     fn = str(getattr(path, 'name', path)).lower()
     if fn.endswith(".parquet"):
@@ -54,23 +73,29 @@ def _read_any(path):
     except UnicodeDecodeError:
         return pd.read_csv(path, encoding="latin1", low_memory=False)
 
-def _safe_num_cols(df: pd.DataFrame) -> pd.DataFrame:
+def _safe_fix_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     for c in df.columns:
         if df[c].dtype == "O":
             try:
-                s = pd.to_numeric(df[c], errors="coerce")
-                if s.notna().mean() > 0.5:
-                    df[c] = s
+                # Try numeric; if it doesn't coerce, keep as object
+                v = pd.to_numeric(df[c], errors="coerce")
+                # Keep as numeric only if many values actually convert
+                if v.notna().sum() >= max(5, int(0.5 * len(v))):
+                    df[c] = v
             except Exception:
                 pass
     return df
+
+def dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[:, ~df.columns.duplicated()]
 
 def zscore(a):
     a = np.asarray(a, dtype=np.float64)
     mu = np.nanmean(a); sd = np.nanstd(a) + 1e-9
     return (a - mu) / sd
 
-def embargo_time_splits(dates_series, n_splits=5, embargo_days=1):
+def embargo_time_splits(dates_series, n_splits=N_FOLDS, embargo_days=1):
     dates = pd.to_datetime(dates_series).reset_index(drop=True)
     u_days = pd.Series(dates.dt.floor("D")).dropna().unique()
     u_days = pd.to_datetime(u_days)
@@ -92,7 +117,7 @@ def embargo_time_splits(dates_series, n_splits=5, embargo_days=1):
             folds.append((tr_idx, va_idx))
     return folds
 
-def tune_temperature_for_topk(p_oof, y, K=TOPK_EVAL, T_grid=np.linspace(0.8, 1.6, 17)):
+def tune_temperature_for_topk(p_oof, y, K=TOPK, T_grid=np.linspace(0.8, 1.6, 17)):
     y = np.asarray(y).astype(int)
     best_T, best_hits = 1.0, -1
     logits = logit(np.clip(p_oof, 1e-6, 1-1e-6))
@@ -108,92 +133,75 @@ def _rank_desc(x):
     x = np.asarray(x)
     return pd.Series(-x).rank(method="min").astype(int).values
 
-# ---------- Uploads ----------
+# ============= SIDEBAR — UPLOADS & KEYS =============
 with st.sidebar:
     st.header("📤 Upload Data")
-    ev_file  = st.file_uploader("Event-level CSV/Parquet (must include hr_outcome)", type=["csv","parquet"], key="ev")
-    bat_file = st.file_uploader("Season-long Batter Profile CSV (optional)", type=["csv"], key="bat")
-    pit_file = st.file_uploader("Season-long Pitcher Profile CSV (optional)", type=["csv"], key="pit")
+    ev_file  = st.file_uploader("Event-level (CSV/Parquet)", type=["csv","parquet"], key="ev")
+    bat_file = st.file_uploader("Batter Profile (CSV)", type=["csv"], key="bat")
+    pit_file = st.file_uploader("Pitcher Profile (CSV)", type=["csv"], key="pit")
 
-if ev_file is None:
-    st.info("Upload an event-level dataset to begin.")
+if ev_file is None or bat_file is None or pit_file is None:
+    st.info("Upload event-level + batter profile + pitcher profile to begin.")
     st.stop()
 
-# ---------- Load ----------
+# ============= LOAD & LIGHT CLEANING =============
 with st.spinner("Loading files..."):
     ev  = _read_any(ev_file)
-    bat = _read_any(bat_file) if bat_file else pd.DataFrame()
-    pit = _read_any(pit_file) if pit_file else pd.DataFrame()
+    bat = _read_any(bat_file)
+    pit = _read_any(pit_file)
 
-ev  = _safe_num_cols(ev)
-if not bat.empty: bat = _safe_num_cols(bat)
-if not pit.empty: pit = _safe_num_cols(pit)
+ev  = dedup_columns(_safe_fix_types(ev))
+bat = dedup_columns(_safe_fix_types(bat))
+pit = dedup_columns(_safe_fix_types(pit))
 
 st.write(f"Event rows: {len(ev):,} | Batter rows: {len(bat):,} | Pitcher rows: {len(pit):,}")
 
-# ---------- Derive RBI and Total Bases BEFORE dropping leak columns ----------
-def derive_rbi(df: pd.DataFrame) -> pd.Series:
-    if "rbi" in df.columns:
-        s = pd.to_numeric(df["rbi"], errors="coerce").fillna(0).astype(int)
-        return s.clip(lower=0, upper=4)
-    if {"bat_score","post_bat_score"}.issubset(df.columns):
-        s = (pd.to_numeric(df["post_bat_score"], errors="coerce") 
-             - pd.to_numeric(df["bat_score"], errors="coerce"))
-        return s.fillna(0).clip(lower=0, upper=4).astype(int)
-    needs = {"home_score","away_score","post_home_score","post_away_score","inning_topbot"}
-    if needs.issubset(df.columns):
-        bot = df["inning_topbot"].astype(str).str.upper().str.startswith("B")
-        inc_home = (pd.to_numeric(df["post_home_score"], errors="coerce") 
-                    - pd.to_numeric(df["home_score"], errors="coerce")).fillna(0)
-        inc_away = (pd.to_numeric(df["post_away_score"], errors="coerce") 
-                    - pd.to_numeric(df["away_score"], errors="coerce")).fillna(0)
-        s = np.where(bot, inc_home, inc_away)
-        return pd.Series(s).clip(lower=0, upper=4).astype(int)
-    return pd.Series(0, index=df.index, dtype=int)
+# ============= KEYS (default to batter_id/pitcher_id) =============
+def _default_key(options, prefer):
+    if prefer in options: return prefer
+    # fallback: first column
+    return options[0] if len(options) else None
 
-TB_MAP = {
-    "single": 1, "double": 2, "triple": 3, "home_run": 4, "grand_slam": 4
-}
-def derive_tb(df: pd.DataFrame) -> pd.Series:
-    evs = df.get("events", pd.Series("", index=df.index)).astype(str).str.lower().str.strip()
-    return evs.map(TB_MAP).fillna(0).astype(int)
+ev_batter_key = _default_key(list(ev.columns), "batter_id") if "batter_id" in ev.columns else _default_key(list(ev.columns), "batter")
+ev_pitcher_key = _default_key(list(ev.columns), "pitcher_id") if "pitcher_id" in ev.columns else _default_key(list(ev.columns), "pitcher")
+bat_key = _default_key(list(bat.columns), "batter_id")
+pit_key = _default_key(list(pit.columns), "pitcher_id")
 
-ev = ev.copy()
-ev["rbi_derived"] = derive_rbi(ev)
-ev["tb_derived"]  = derive_tb(ev)
-ev["rbi_ge2"]     = (ev["rbi_derived"] >= 2).astype(int)
-ev["tb_ge2"]      = (ev["tb_derived"]  >= 2).astype(int)
+with st.expander("🔗 Join Keys (adjust only if needed)"):
+    ev_batter_key = st.selectbox("Event → Batter key", options=sorted(ev.columns), index=sorted(ev.columns).index(ev_batter_key))
+    bat_key       = st.selectbox("Batter profile key", options=sorted(bat.columns), index=sorted(bat.columns).index(bat_key))
+    ev_pitcher_key= st.selectbox("Event → Pitcher key", options=sorted(ev.columns), index=sorted(ev.columns).index(ev_pitcher_key))
+    pit_key       = st.selectbox("Pitcher profile key", options=sorted(pit.columns), index=sorted(pit.columns).index(pit_key))
 
-# ---------- Targets ----------
-targets = {"hr_outcome": "HR", "tb_ge2": "TB≥2", "rbi_ge2": "RBI≥2"}
-missing = [t for t in targets if t not in ev.columns]
-if missing:
-    st.error(f"Missing required targets in event file: {missing}")
-    st.stop()
+# ============= MERGE (robust like prediction app) =============
+def _as_str(s):
+    return s.astype(str).str.strip().fillna("")
 
-# ---------- Optional: Join season profiles (type-safe) ----------
-if not bat.empty or not pit.empty:
-    st.subheader("🔗 Joining Season Profiles")
-    # pick plausible keys automatically (first match)
-    ev_batter_key = next((c for c in ev.columns if "bat" in c or "player" in c or "id" in c), None)
-    ev_pitcher_key = next((c for c in ev.columns if "pit" in c or "pitcher" in c or "id" in c), None)
-    bat_key = bat.columns[0] if not bat.empty else None
-    pit_key = pit.columns[0] if not pit.empty else None
+def _safe_merge_profiles(ev, bat, pit, ev_batter_key, bat_key, ev_pitcher_key, pit_key):
+    ev = ev.copy()
+    bat_pref = bat.add_prefix("batprof_").copy()
+    pit_pref = pit.add_prefix("pitprof_").copy()
 
-    with st.spinner("Merging profiles…"):
-        if not bat.empty and ev_batter_key and bat_key:
-            bat_pref = bat.add_prefix("batprof_").rename(columns={f"batprof_{bat_key}":"bat_key_merge"})
-            ev["bat_key_merge"] = ev[ev_batter_key].astype(str)
-            bat_pref["bat_key_merge"] = bat_pref["bat_key_merge"].astype(str)
-            ev = ev.merge(bat_pref, on="bat_key_merge", how="left")
-        if not pit.empty and ev_pitcher_key and pit_key:
-            pit_pref = pit.add_prefix("pitprof_").rename(columns={f"pitprof_{pit_key}":"pit_key_merge"})
-            ev["pit_key_merge"] = ev[ev_pitcher_key].astype(str)
-            pit_pref["pit_key_merge"] = pit_pref["pit_key_merge"].astype(str)
-            ev = ev.merge(pit_pref, on="pit_key_merge", how="left")
-    st.success("✅ Profiles merged.")
+    # Restore the key names post-prefix so we can merge
+    bat_pref = bat_pref.rename(columns={f"batprof_{bat_key}": "bat_key_merge"})
+    pit_pref = pit_pref.rename(columns={f"pitprof_{pit_key}": "pit_key_merge"})
 
-# ---------- Drop leak-prone columns AFTER deriving labels ----------
+    # Create merge keys as string to avoid int/object mismatch
+    ev["bat_key_merge"] = _as_str(ev[ev_batter_key]) if ev_batter_key in ev.columns else _as_str(ev.iloc[:,0])
+    ev["pit_key_merge"] = _as_str(ev[ev_pitcher_key]) if ev_pitcher_key in ev.columns else _as_str(ev.iloc[:,0])
+    bat_pref["bat_key_merge"] = _as_str(bat_pref["bat_key_merge"])
+    pit_pref["pit_key_merge"] = _as_str(pit_pref["pit_key_merge"])
+
+    # Merge left
+    ev = ev.merge(bat_pref, on="bat_key_merge", how="left")
+    ev = ev.merge(pit_pref, on="pit_key_merge", how="left")
+    return ev
+
+with st.spinner("Merging profiles into event-level…"):
+    ev = _safe_merge_profiles(ev, bat, pit, ev_batter_key, bat_key, ev_pitcher_key, pit_key)
+st.success("✅ Profiles merged.")
+
+# ============= DROP OBVIOUS LEAKS (same as main app family) =============
 LEAK = {
     "post_away_score","post_home_score","post_bat_score","post_fld_score",
     "delta_home_win_exp","delta_run_exp","delta_pitcher_run_exp",
@@ -204,134 +212,202 @@ LEAK = {
 }
 ev = ev.drop(columns=[c for c in ev.columns if c in LEAK], errors="ignore")
 
-# ---------- Feature matrix ----------
-y_hr   = ev["hr_outcome"].astype(int).reset_index(drop=True)
-y_tb2  = ev["tb_ge2"].astype(int).reset_index(drop=True)
-y_rbi2 = ev["rbi_ge2"].astype(int).reset_index(drop=True)
+# ============= DERIVE TB≥2 & RBI≥2 IF MISSING =============
+def _derive_tb_rbi_labels(ev: pd.DataFrame) -> pd.DataFrame:
+    ev = ev.copy()
 
-dates = (pd.to_datetime(ev["game_date"], errors="coerce")
-         if "game_date" in ev.columns else pd.Series(pd.Timestamp("2000-01-01"), index=ev.index)).fillna(pd.Timestamp("2000-01-01"))
+    # Choose event text col
+    evt = ev["events_clean"] if "events_clean" in ev.columns else ev.get("events", pd.Series("", index=ev.index))
+    evt = evt.astype(str).str.lower().fillna("")
 
+    # Group per (game, batter)
+    grp_cols = []
+    if "game_pk" in ev.columns: grp_cols.append("game_pk")
+    if "batter_id" in ev.columns: grp_cols.append("batter_id")
+    if not grp_cols:
+        if "game_date" in ev.columns and "batter_id" in ev.columns:
+            grp_cols = ["game_date","batter_id"]
+        else:
+            grp_cols = ["batter_id"]
+
+    # TB≥2
+    if "tb_ge_2" not in ev.columns:
+        tb_map = {"home_run":4, "triple":3, "double":2, "single":1}
+        tb_pa = np.zeros(len(ev), dtype=np.int16)
+        for k, v in tb_map.items():
+            tb_pa = np.where(evt.str.contains(k), v, tb_pa)
+        ev["__tb_pa"] = tb_pa
+        tb_game = ev.groupby(grp_cols, dropna=False)["__tb_pa"].sum().rename("__tb_game")
+        ev = ev.merge(tb_game, on=grp_cols, how="left")
+        ev["tb_ge_2"] = (ev["__tb_game"] >= 2).astype(int)
+        ev.drop(columns=["__tb_pa","__tb_game"], inplace=True, errors="ignore")
+
+    # RBI≥2
+    if "rbi_ge_2" not in ev.columns:
+        if "rbi" in ev.columns:
+            rbi_pa = pd.to_numeric(ev["rbi"], errors="coerce").fillna(0).astype(int)
+        else:
+            # Conservative: RBIs from HR only using runners_on
+            if set(["on_1b","on_2b","on_3b"]).issubset(ev.columns):
+                runners_on = ev[["on_1b","on_2b","on_3b"]].notna().sum(axis=1).astype(int)
+            else:
+                runners_on = pd.Series(0, index=ev.index, dtype=int)
+            is_hr = evt.str.contains("home_run")
+            rbi_pa = (is_hr.astype(int) * (1 + runners_on)).astype(int)
+
+        ev["__rbi_pa"] = rbi_pa
+        rbi_game = ev.groupby(grp_cols, dropna=False)["__rbi_pa"].sum().rename("__rbi_game")
+        ev = ev.merge(rbi_game, on=grp_cols, how="left")
+        ev["rbi_ge_2"] = (ev["__rbi_game"] >= 2).astype(int)
+        ev.drop(columns=["__rbi_pa","__rbi_game"], inplace=True, errors="ignore")
+
+    return ev
+
+with st.spinner("Deriving TB≥2 and RBI≥2 labels (if missing)…"):
+    ev = _derive_tb_rbi_labels(ev)
+st.success("✅ Derived TB≥2 / RBI≥2 (if needed).")
+
+# ============= TARGETS & DATES =============
+if "hr_outcome" not in ev.columns:
+    st.error("Your event-level file must include hr_outcome (0/1) for the HR target.")
+    st.stop()
+
+y_hr   = ev["hr_outcome"].fillna(0).astype(int)
+y_tb2  = ev["tb_ge_2"].fillna(0).astype(int)
+y_rbi2 = ev["rbi_ge_2"].fillna(0).astype(int)
+
+dates_col = "game_date" if "game_date" in ev.columns else None
+if dates_col:
+    dates = pd.to_datetime(ev[dates_col], errors="coerce").fillna(pd.Timestamp("2000-01-01"))
+else:
+    dates = pd.Series(pd.Timestamp("2000-01-01"), index=ev.index)
+
+# ============= BASIC FEATURES (numeric only, weather-free) =============
 num_cols = ev.select_dtypes(include=[np.number]).columns.tolist()
-X_base = ev[num_cols].copy().replace([np.inf,-np.inf], np.nan).fillna(-1.0).astype(np.float32)
+X_base = ev[num_cols].replace([np.inf, -np.inf], np.nan).fillna(-1.0).astype(np.float32)
 
-# ---------- Train base models (once per target) ----------
-st.subheader("⚙️ Training Base Models (early stopping, 5 folds)")
-folds = embargo_time_splits(dates, n_splits=N_SPLITS, embargo_days=1)
-seeds = [42, 101, 202, 404]
+# ============= TRAIN BASE MODELS (OOF) ON HR (used for all targets) =============
+st.subheader("⚙️ Training Base Models (with early stopping)")
+folds = embargo_time_splits(dates, n_splits=N_FOLDS, embargo_days=1)
 
-def train_oof(X, y):
-    P_xgb = np.zeros(len(y), dtype=np.float32)
-    P_lgb = np.zeros(len(y), dtype=np.float32)
-    P_cat = np.zeros(len(y), dtype=np.float32)
-    for fi, (tr_idx, va_idx) in enumerate(folds):
-        t0 = time.time()
-        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
-        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-        xgb_va, lgb_va, cat_va = [], [], []
-        for sd in seeds:
-            spw = max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum()))
-            xgb_clf = xgb.XGBClassifier(
-                n_estimators=900, max_depth=6, learning_rate=0.03,
-                subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
-                eval_metric="logloss", tree_method="hist",
-                scale_pos_weight=spw, early_stopping_rounds=50,
-                n_jobs=1, verbosity=0, random_state=sd
-            )
-            lgb_clf = lgb.LGBMClassifier(
-                n_estimators=1600, learning_rate=0.03, max_depth=-1, num_leaves=63,
-                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                reg_lambda=2.0, is_unbalance=True, n_jobs=1, random_state=sd
-            )
-            cat_clf = cb.CatBoostClassifier(
-                iterations=1800, depth=7, learning_rate=0.03, l2_leaf_reg=6.0,
-                loss_function="Logloss", eval_metric="Logloss",
-                class_weights=[1.0, spw], od_type="Iter", od_wait=50,
-                verbose=0, thread_count=1, random_seed=sd
-            )
-            xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-            lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-            cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-            xgb_va.append(xgb_clf.predict_proba(X_va)[:,1])
-            lgb_va.append(lgb_clf.predict_proba(X_va)[:,1])
-            cat_va.append(cat_clf.predict_proba(X_va)[:,1])
-        P_xgb[va_idx] = np.mean(xgb_va, axis=0)
-        P_lgb[va_idx] = np.mean(lgb_va, axis=0)
-        P_cat[va_idx] = np.mean(cat_va, axis=0)
-        dt = time.time() - t0
-        st.write(f"Fold {fi+1}/{len(folds)} in {timedelta(seconds=int(dt))}")
-    return P_xgb, P_lgb, P_cat
+P_xgb_oof = np.zeros(len(y_hr), dtype=np.float32)
+P_lgb_oof = np.zeros(len(y_hr), dtype=np.float32)
+P_cat_oof = np.zeros(len(y_hr), dtype=np.float32)
+ranker_oof = np.zeros(len(y_hr), dtype=np.float32)
 
-with st.spinner("Training base learners (HR)…"):
-    P_xgb_hr, P_lgb_hr, P_cat_hr = train_oof(X_base, y_hr)
-with st.spinner("Training base learners (TB≥2)…"):
-    P_xgb_tb, P_lgb_tb, P_cat_tb = train_oof(X_base, y_tb2)
-with st.spinner("Training base learners (RBI≥2)…"):
-    P_xgb_rbi, P_lgb_rbi, P_cat_rbi = train_oof(X_base, y_rbi2)
+fold_times = []
+for fi, (tr_idx, va_idx) in enumerate(folds):
+    t0 = time.time()
+    X_tr, X_va = X_base.iloc[tr_idx], X_base.iloc[va_idx]
+    y_tr, y_va = y_hr.iloc[tr_idx], y_hr.iloc[va_idx]
 
-# ---------- Day-wise Ranker (optional if multiple days) ----------
-st.subheader("📈 Day-wise Ranker")
-def train_ranker_oof(X, y):
-    if dates.nunique() <= 1:
-        return np.zeros(len(y), dtype=np.float32)
-    days = pd.to_datetime(dates).dt.floor("D")
-    def _groups_from_days(d): return d.groupby(d.values).size().values.tolist()
-    rk_oof = np.zeros(len(y), dtype=np.float32)
-    for fi, (tr_idx, va_idx) in enumerate(folds):
-        X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
-        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-        d_tr, d_va = days.iloc[tr_idx], days.iloc[va_idx]
-        g_tr, g_va = _groups_from_days(d_tr), _groups_from_days(d_va)
+    preds_xgb, preds_lgb, preds_cat = [], [], []
+
+    for sd in SEEDS:
+        spw = max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum()))
+
+        xgb_clf = xgb.XGBClassifier(
+            n_estimators=900, max_depth=6, learning_rate=0.035,
+            subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
+            eval_metric="logloss", tree_method="hist",
+            scale_pos_weight=spw, early_stopping_rounds=50,
+            n_jobs=1, verbosity=0, random_state=sd
+        )
+        lgb_clf = lgb.LGBMClassifier(
+            n_estimators=1600, learning_rate=0.035, max_depth=-1, num_leaves=63,
+            feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+            reg_lambda=2.0, is_unbalance=True, n_jobs=1, random_state=sd
+        )
+        cat_clf = cb.CatBoostClassifier(
+            iterations=1800, depth=7, learning_rate=0.035, l2_leaf_reg=6.0,
+            loss_function="Logloss", eval_metric="Logloss",
+            class_weights=[1.0, spw], od_type="Iter", od_wait=50,
+            verbose=0, thread_count=1, random_seed=sd
+        )
+
+        xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
+                    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
+        cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+
+        preds_xgb.append(xgb_clf.predict_proba(X_va)[:,1])
+        preds_lgb.append(lgb_clf.predict_proba(X_va)[:,1])
+        preds_cat.append(cat_clf.predict_proba(X_va)[:,1])
+
+    P_xgb_oof[va_idx] = np.mean(preds_xgb, axis=0)
+    P_lgb_oof[va_idx] = np.mean(preds_lgb, axis=0)
+    P_cat_oof[va_idx] = np.mean(preds_cat, axis=0)
+
+    # Day-wise ranker on HR labels (optional but helpful)
+    days_tr = pd.to_datetime(dates.iloc[tr_idx]).dt.floor("D")
+    days_va = pd.to_datetime(dates.iloc[va_idx]).dt.floor("D")
+    def _groups_from_days(d):
+        return d.groupby(d.values).size().values.tolist()
+    try:
         rk = lgb.LGBMRanker(
             objective="lambdarank", metric="ndcg",
-            n_estimators=600, learning_rate=0.05, num_leaves=63,
+            n_estimators=700, learning_rate=0.05, num_leaves=63,
             feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
             random_state=fi
         )
-        rk.fit(X_tr, y_tr, group=g_tr, eval_set=[(X_va, y_va)], eval_group=[g_va],
+        rk.fit(X_tr, y_tr, group=_groups_from_days(days_tr), eval_set=[(X_va, y_va)], eval_group=[_groups_from_days(days_va)],
                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])
-        rk_oof[va_idx] = rk.predict(X_va)
-    return rk_oof
+        ranker_oof[va_idx] = rk.predict(X_va)
+    except Exception:
+        # if ranks can’t be computed reliably (single day etc.), leave zeros
+        pass
 
-with st.spinner("Training rankers…"):
-    rk_hr  = train_ranker_oof(X_base, y_hr)
-    rk_tb  = train_ranker_oof(X_base, y_tb2)
-    rk_rbi = train_ranker_oof(X_base, y_rbi2)
+    dt = time.time() - t0
+    fold_times.append(dt)
+    st.write(f"Fold {fi+1}/{len(folds)} finished in {timedelta(seconds=int(dt))}")
 
-# ---------- Meta + Calibration (per target) ----------
-st.subheader("🧮 Meta + Isotonic + Top-30 Temp Tuning")
-def stack_and_calibrate(Px, Pl, Pc, y, label):
-    Xm = np.column_stack([Px, Pl, Pc]).astype(np.float32)
-    sc = StandardScaler()
-    Xm_s = sc.fit_transform(Xm)
-    meta = LogisticRegression(max_iter=1000, solver="lbfgs")
-    meta.fit(Xm_s, y.values)
-    oof = meta.predict_proba(Xm_s)[:,1]
-    auc = roc_auc_score(y, oof); ll = log_loss(y, oof)
-    st.write(f"{label} — OOF AUC: {auc:.4f} | LogLoss: {ll:.4f}")
-    iso = IsotonicRegression(out_of_bounds="clip")
-    y_iso = iso.fit_transform(oof, y.values)
-    Tbest = tune_temperature_for_topk(y_iso, y.values, K=TOPK_EVAL, T_grid=np.linspace(0.8, 1.6, 17))
-    logits = logit(np.clip(y_iso, 1e-6, 1-1e-6))
-    p_base = expit(logits * Tbest)
-    return p_base, (Px, Pl, Pc)
+# ============= META STACKER + CALIBRATION (on HR OOF) =============
+st.subheader("🧮 Meta Stacker + Calibration (trained on HR OOF)")
+X_meta = np.column_stack([P_xgb_oof, P_lgb_oof, P_cat_oof]).astype(np.float32)
+scaler_meta = StandardScaler()
+X_meta_s = scaler_meta.fit_transform(X_meta)
+meta = LogisticRegression(max_iter=1000, solver="lbfgs")
+meta.fit(X_meta_s, y_hr.values)
+oof_meta = meta.predict_proba(X_meta_s)[:,1]
+st.write(f"OOF AUC (HR meta): {roc_auc_score(y_hr, oof_meta):.4f} | OOF LogLoss: {log_loss(y_hr, oof_meta):.4f}")
 
-p_hr,  base_hr  = stack_and_calibrate(P_xgb_hr,  P_lgb_hr,  P_cat_hr,  y_hr,   "HR")
-p_tb,  base_tb  = stack_and_calibrate(P_xgb_tb,  P_lgb_tb,  P_cat_tb,  y_tb2,  "TB≥2")
-p_rbi, base_rbi = stack_and_calibrate(P_xgb_rbi, P_lgb_rbi, P_cat_rbi, y_rbi2, "RBI≥2")
+ir = IsotonicRegression(out_of_bounds="clip")
+y_oof_iso = ir.fit_transform(oof_meta, y_hr.values)
+Tbest = tune_temperature_for_topk(y_oof_iso, y_hr.values, K=TOPK, T_grid=np.linspace(0.8, 1.6, 17))
+logits_oof = logit(np.clip(y_oof_iso, 1e-6, 1-1e-6))
+p_base_hr = expit(logits_oof * Tbest)  # calibrated, temp-tuned HR OOF
 
-# ---------- Weather-free Overlay (optional via profiles) ----------
-st.subheader("🧩 Overlay from Season Profiles (weather-free)")
-bat_cols = dict(barrel="batprof_barrel_rate", fb="batprof_fb_rate", pull="batprof_pull_rate", hr_pa="batprof_hr_per_pa")
-pit_cols = dict(brl_allowed="pitprof_barrel_rate_allowed", fb="pitprof_fb_rate", bb="pitprof_bb_rate", xwoba_con="pitprof_xwoba_con")
-platoon_cols = dict(
-    batter_vsL="batprof_hr_pa_vsL", batter_vsR="batprof_hr_pa_vsR",
-    pitcher_vsL="pitprof_hr_pa_vsL", pitcher_vsR="pitprof_hr_pa_vsR",
-    stand="stand", batter_hand="batter_hand", p_throws="pitcher_hand"
+# We’ll reuse p_base_hr as the calibrated base signal for TB/RBI too (shared model capacity).
+# (If you want, we can add simple target-specific reweighting later.)
+
+# ============= WEATHER-FREE OVERLAY FROM PROFILES =============
+# Column knobs (adjust names to your profile schema)
+bat_cols = dict(
+    barrel="batprof_barrel_rate",
+    fb="batprof_fb_rate",
+    pull="batprof_pull_rate",
+    hr_pa="batprof_hr_per_pa"
 )
-park_cols = dict(park_factor="park_hr_rate")
+pit_cols = dict(
+    brl_allowed="pitprof_barrel_rate_allowed",
+    fb="pitprof_fb_rate",
+    bb="pitprof_bb_rate",
+    xwoba_con="pitprof_xwoba_con"
+)
+platoon_cols = dict(
+    batter_vsL="batprof_hr_pa_vsL",
+    batter_vsR="batprof_hr_pa_vsR",
+    pitcher_vsL="pitprof_hr_pa_vsL",
+    pitcher_vsR="pitprof_hr_pa_vsR",
+    stand="stand",
+    batter_hand="batter_hand",
+    p_throws="pitcher_hand"
+)
+park_cols = dict(
+    park_factor="park_hr_rate",
+)
 
-def _platoon_factor(row):
+def _platoon_factor_row(row):
     bhand = str(row.get(platoon_cols["stand"], row.get(platoon_cols["batter_hand"], "R"))).upper()
     phand = str(row.get(platoon_cols["p_throws"], "R")).upper()
     if bhand == "L":
@@ -351,7 +427,7 @@ def _platoon_factor(row):
         f *= 1.01
     return float(np.clip(f, 0.94, 1.10))
 
-def _batter_factor(row):
+def _batter_factor_row(row):
     f = 1.0
     brl = row.get(bat_cols["barrel"], np.nan)
     fb  = row.get(bat_cols["fb"], np.nan)
@@ -365,7 +441,7 @@ def _batter_factor(row):
     if pd.notnull(hrp) and hrp >= 0.06: f *= 1.03
     return float(np.clip(f, 0.95, 1.10))
 
-def _pitcher_factor(row):
+def _pitcher_factor_row(row):
     f = 1.0
     brlA = row.get(pit_cols["brl_allowed"], np.nan)
     fb   = row.get(pit_cols["fb"], np.nan)
@@ -381,146 +457,160 @@ def _pitcher_factor(row):
         elif xcon >= 0.36: f *= 1.02
     return float(np.clip(f, 0.94, 1.12))
 
-def _park_factor(row):
+def _park_factor_row(row):
     pf = row.get(park_cols["park_factor"], np.nan)
     try:
-        return float(np.clip(float(pf), 0.85, 1.20))
+        pf = float(pf)
+        return float(np.clip(pf, 0.85, 1.20))
     except Exception:
         return 1.0
 
-if not bat.empty or not pit.empty:
-    bf   = ev.apply(_batter_factor, axis=1)
-    pfct = ev.apply(_pitcher_factor, axis=1)
-    pltf = ev.apply(_platoon_factor, axis=1)
-    pkf  = ev.apply(_park_factor, axis=1)
-else:
-    bf = pfct = pltf = pkf = pd.Series(1.0, index=ev.index, dtype=float)
+with st.spinner("Computing overlay components (profiles only)…"):
+    bf = ev.apply(_batter_factor_row, axis=1).astype(np.float32)
+    pf = ev.apply(_pitcher_factor_row, axis=1).astype(np.float32)
+    pltf = ev.apply(_platoon_factor_row, axis=1).astype(np.float32)
+    pkf = ev.apply(_park_factor_row, axis=1).astype(np.float32)
 
+# ============= BUILD RRF + DISAGREEMENT OFF OOF (once) =============
+disagree_std = np.std(np.vstack([P_xgb_oof, P_lgb_oof, P_cat_oof]), axis=0)
+dis_penalty = np.clip(zscore(disagree_std), 0, 3)
+
+r_prob    = _rank_desc(p_base_hr)
+r_ranker  = _rank_desc(zscore(ranker_oof))
+# overlay will be recomputed per-target after exponent tuning
+k_rrf = 60.0
+
+# ============= TUNERS (per target) =============
 def overlay_from_exponents(a_b, b_p, c_pl, d_pk):
-    ov = (bf**a_b) * (pfct**b_p) * (pltf**c_pl) * (pkf**d_pk)
+    ov = (bf**a_b) * (pf**b_p) * (pltf**c_pl) * (pkf**d_pk)
     return np.asarray(np.clip(ov, 0.80, 1.40), dtype=np.float32)
 
-# ---------- Multiplier Tuner (auto-run; anchor on HR) ----------
-use_mult = st.session_state.saved_best_mult.copy()
-rng = np.random.default_rng(123)
-best_key = None; best_res = None
-for _ in range(MULT_SAMPLES):
-    a_b = float(rng.uniform(0.2, 1.6))
-    b_p = float(rng.uniform(0.2, 1.6))
-    c_pl= float(rng.uniform(0.0, 1.2))
-    d_pk= float(rng.uniform(0.0, 1.2))
-    ov  = overlay_from_exponents(a_b, b_p, c_pl, d_pk)
-    eval_score = expit(logit(np.clip(p_hr,1e-6,1-1e-6)) + np.log(ov+1e-9))
-    order = np.argsort(-eval_score)
-    hK = int(y_hr.values[order][:TOPK_EVAL].sum())
-    rel_sorted = y_hr.values[order]
-    discounts = 1.0/np.log2(np.arange(2, 2+min(30,len(rel_sorted))))
-    dcg = float((rel_sorted[:len(discounts)]*discounts).sum())
-    ideal = np.sort(y_hr.values)[::-1]
-    idcg = float((ideal[:len(discounts)]*discounts).sum())
-    nd = (dcg/idcg) if idcg>0 else 0.0
-    key = (hK, nd)
-    if (best_key is None) or (key > best_key):
-        best_key = key
-        best_res = dict(a_batter=a_b, b_pitcher=b_p, c_platoon=c_pl, d_park=d_pk, HitsAtK=hK, NDCG30=nd)
+def _hits_at_k(y_true, s, K=TOPK):
+    ord_idx = np.argsort(-s)
+    return int(np.sum(y_true[ord_idx][:K]))
 
-if best_res:
-    st.session_state.saved_best_mult = {k:best_res[k] for k in ["a_batter","b_pitcher","c_platoon","d_park"]}
-    use_mult = st.session_state.saved_best_mult.copy()
-    st.success(f"Overlay exponents: {json.dumps(use_mult, indent=2)} | HR Hits@{TOPK_EVAL}={best_res['HitsAtK']} NDCG@30={best_res['NDCG30']:.4f}")
+def _dcg_at_k(rels, K):
+    rels = np.asarray(rels)[:K]
+    if rels.size == 0: return 0.0
+    discounts = 1.0/np.log2(np.arange(2, 2+len(rels)))
+    return float(np.sum(rels*discounts))
 
-overlay = overlay_from_exponents(use_mult["a_batter"], use_mult["b_pitcher"], use_mult["c_platoon"], use_mult["d_park"])
-log_overlay = np.log(overlay + 1e-9)
-
-# ---------- RRF + disagreement + blend ----------
-def blended_oof(p_base, Px, Pl, Pc, ranker_oof):
-    disagree_std = np.std(np.vstack([Px, Pl, Pc]), axis=0)
-    dis_penalty = np.clip(zscore(disagree_std), 0, 3)
-    r_prob    = _rank_desc(p_base)
-    r_ranker  = _rank_desc(zscore(ranker_oof))
-    r_overlay = _rank_desc(overlay)
-    k_rrf = 60.0
-    rrf = 1.0/(k_rrf + r_prob) + 1.0/(k_rrf + r_ranker) + 1.0/(k_rrf + r_overlay)
-    rrf_z = zscore(rrf)
-    return dis_penalty, rrf_z, zscore(ranker_oof)
+def _ndcg_at_k(y_true, s, K):
+    ord_idx = np.argsort(-s)
+    rel_sorted = y_true[ord_idx]
+    dcg = _dcg_at_k(rel_sorted, K)
+    ideal = np.sort(y_true)[::-1]
+    idcg = _dcg_at_k(ideal, K)
+    return (dcg/idcg) if idcg > 0 else 0.0
 
 def blend_with_weights(wp, wo, wr, wrrf, wpen, logit_p, log_overlay, ranker_z, rrf_z, dis_penalty):
     return expit(wp*logit_p + wo*log_overlay + wr*ranker_z + wrrf*rrf_z - wpen*dis_penalty)
 
-def tune_blend(label, p_base, base_triplet, y, ranker_oof):
-    Px, Pl, Pc = base_triplet
-    dis_penalty, rrf_z, ranker_z = blended_oof(p_base, Px, Pl, Pc, ranker_oof)
-    use_blend = st.session_state.saved_best_blend.copy()
-    logit_p = logit(np.clip(p_base, 1e-6, 1-1e-6))
+def run_all_tuners_for_target(y_target: pd.Series, target_name: str):
+    # Start from currently saved defaults for this target
+    use_mult = st.session_state.best_by_target[target_name]["mult"].copy()
+    use_blend= st.session_state.best_by_target[target_name]["blend"].copy()
+
+    # (A) Multiplier Tuner (overlay exponents)
+    rng = np.random.default_rng(123)
+    best_key = None; best_res = None
+    for _ in range(SAMPLES_MULT):
+        a_b = float(rng.uniform(0.2, 1.6))
+        b_p = float(rng.uniform(0.2, 1.6))
+        c_pl= float(rng.uniform(0.0, 1.2))
+        d_pk= float(rng.uniform(0.0, 1.2))
+        ov = overlay_from_exponents(a_b, b_p, c_pl, d_pk)
+        # Evaluate via calibrated base prob + overlay (as a proxy)
+        eval_score = expit(logit(np.clip(p_base_hr,1e-6,1-1e-6)) + np.log(ov+1e-9))
+        hK = _hits_at_k(y_target.values, eval_score, TOPK)
+        nd = _ndcg_at_k(y_target.values, eval_score, 30)
+        key = (hK, nd)
+        if (best_key is None) or (key > best_key):
+            best_key = key
+            best_res = dict(a_batter=a_b, b_pitcher=b_p, c_platoon=c_pl, d_park=d_pk, HitsAtK=hK, NDCG30=nd)
+    if best_res:
+        use_mult = {k:best_res[k] for k in ["a_batter","b_pitcher","c_platoon","d_park"]}
+
+    # Final overlay & logs for this target
+    overlay = overlay_from_exponents(use_mult["a_batter"], use_mult["b_pitcher"], use_mult["c_platoon"], use_mult["d_park"])
+    log_overlay = np.log(overlay + 1e-9)
+
+    # (B) Build RRF (needs overlay ranks)
+    r_overlay = _rank_desc(overlay)
+    rrf = 1.0/(k_rrf + r_prob) + 1.0/(k_rrf + r_ranker) + 1.0/(k_rrf + r_overlay)
+    rrf_z = zscore(rrf)
+    ranker_z = zscore(ranker_oof)
+    logit_p = logit(np.clip(p_base_hr, 1e-6, 1-1e-6))
+
+    # (C) Blended Tuner
     rng = np.random.default_rng(777)
-    best_tup=None; best_row=None
-    for _ in range(BLEND_SAMPLES):
+    best_tuple = None; best_row = None
+    for _ in range(SAMPLES_BLEND):
         w = rng.dirichlet(np.ones(5))
         s = blend_with_weights(w[0], w[1], w[2], w[3], w[4], logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
-        order = np.argsort(-s)
-        hK = int(y.values[order][:TOPK_EVAL].sum())
-        rel_sorted = y.values[order]
-        discounts = 1.0/np.log2(np.arange(2, 2+min(30,len(rel_sorted))))
-        dcg = float((rel_sorted[:len(discounts)]*discounts).sum())
-        ideal = np.sort(y.values)[::-1]
-        idcg = float((ideal[:len(discounts)]*discounts).sum())
-        nd = (dcg/idcg) if idcg>0 else 0.0
-        tup=(hK, nd)
-        if (best_tup is None) or (tup > best_tup):
-            best_tup=tup
-            best_row=dict(w_prob=float(w[0]), w_overlay=float(w[1]), w_ranker=float(w[2]), w_rrf=float(w[3]), w_penalty=float(w[4]),
-                          HitsAtK=int(hK), NDCG30=float(nd))
+        hK = _hits_at_k(y_target.values, s, TOPK)
+        h30 = _hits_at_k(y_target.values, s, 30)
+        nd = _ndcg_at_k(y_target.values, s, 30)
+        tup = (hK, nd, h30)
+        if (best_tuple is None) or (tup > best_tuple):
+            best_tuple = tup
+            best_row = dict(w_prob=float(w[0]), w_overlay=float(w[1]), w_ranker=float(w[2]),
+                            w_rrf=float(w[3]), w_penalty=float(w[4]),
+                            HitsAtK=int(hK), HitsAt30=int(h30), NDCG30=float(nd))
     if best_row:
-        st.session_state.saved_best_blend = {k:best_row[k] for k in ["w_prob","w_overlay","w_ranker","w_rrf","w_penalty"]}
-        use_blend = st.session_state.saved_best_blend.copy()
-        st.success(f"{label} blend: {json.dumps(use_blend, indent=2)} | Hits@{TOPK_EVAL}={best_row['HitsAtK']} NDCG@30={best_row['NDCG30']:.4f}")
+        use_blend = {k:best_row[k] for k in ["w_prob","w_overlay","w_ranker","w_rrf","w_penalty"]}
 
-    final = blend_with_weights(use_blend["w_prob"], use_blend["w_overlay"], use_blend["w_ranker"],
-                               use_blend["w_rrf"], use_blend["w_penalty"],
-                               logit_p, log_overlay, ranker_z, rrf_z, dis_penalty)
-    return final
+    # Final blended OOF (diagnostic)
+    final_oof = blend_with_weights(
+        use_blend["w_prob"], use_blend["w_overlay"], use_blend["w_ranker"], use_blend["w_rrf"], use_blend["w_penalty"],
+        logit_p, log_overlay, ranker_z, rrf_z, dis_penalty
+    )
 
-st.subheader("🧪 Blended Tuning (auto, K=30, folds=5)")
-final_hr  = tune_blend("HR",   p_hr,  base_hr,  y_hr,   rk_hr)
-final_tb  = tune_blend("TB≥2", p_tb,  base_tb,  y_tb2,  rk_tb)
-final_rbi = tune_blend("RBI≥2",p_rbi, base_rbi, y_rbi2, rk_rbi)
+    # Persist
+    st.session_state.best_by_target[target_name]["mult"]  = use_mult.copy()
+    st.session_state.best_by_target[target_name]["blend"] = use_blend.copy()
 
-# ---------- Reports (no plots) ----------
-def hits_at_k(y, s, K):
-    order = np.argsort(-s)
-    return int(y.values[order][:K].sum())
+    # Report
+    out = {
+        "target": target_name,
+        "AUC_final_blend": float(roc_auc_score(y_target, final_oof)) if len(np.unique(y_target))>1 else None,
+        "Hits@30": int(_hits_at_k(y_target.values, final_oof, TOPK)),
+        "NDCG@30": float(_ndcg_at_k(y_target.values, final_oof, 30)),
+        "overlay_exponents": use_mult.copy(),
+        "blend_weights": use_blend.copy(),
+    }
+    return out
 
-st.markdown("### 📊 Final Diagnostics")
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.write("**HR**")
-    st.write(f"Hits@30: {hits_at_k(y_hr, final_hr, TOPK_EVAL)}")
-    try: st.write(f"AUC: {roc_auc_score(y_hr, final_hr):.4f}")
-    except: pass
-with col2:
-    st.write("**TB≥2**")
-    st.write(f"Hits@30: {hits_at_k(y_tb2, final_tb, TOPK_EVAL)}")
-    try: st.write(f"AUC: {roc_auc_score(y_tb2, final_tb):.4f}")
-    except: pass
-with col3:
-    st.write("**RBI≥2**")
-    st.write(f"Hits@30: {hits_at_k(y_rbi2, final_rbi, TOPK_EVAL)}")
-    try: st.write(f"AUC: {roc_auc_score(y_rbi2, final_rbi):.4f}")
-    except: pass
+# ============= RUN TUNERS (HR, TB≥2, RBI≥2) =============
+st.subheader("🔧 Running Tuners (HR / TB≥2 / RBI≥2)")
+with st.spinner("Searching overlay exponents and blend weights (cloud-safe)…"):
+    report_hr   = run_all_tuners_for_target(y_hr,   "HR")
+    report_tb2  = run_all_tuners_for_target(y_tb2,  "TB2")
+    report_rbi2 = run_all_tuners_for_target(y_rbi2, "RBI2")
+st.success("✅ Tuners complete.")
 
-# ---------- Export best weights ----------
-st.subheader("💾 Export Best Weights")
+# ============= REPORTS (concise) =============
+st.markdown("### 📋 Results Summary")
+st.json(report_hr, expanded=False)
+st.json(report_tb2, expanded=False)
+st.json(report_rbi2, expanded=False)
+
+# ============= EXPORT =============
 export_payload = {
-    "multiplier_exponents": st.session_state.saved_best_mult,
-    "blend_weights": st.session_state.saved_best_blend,
-    "notes": f"Weather-free overlay exponents + final blend weights (K={TOPK_EVAL}, folds={N_SPLITS}). Targets: HR, TB≥2, RBI≥2."
+    "notes": "Per-target overlay exponents and blend weights (weather-free), tuned on event-level OOF using HR-trained meta ensemble.",
+    "K": TOPK,
+    "folds": N_FOLDS,
+    "targets": {
+        "HR":   st.session_state.best_by_target["HR"],
+        "TB2":  st.session_state.best_by_target["TB2"],
+        "RBI2": st.session_state.best_by_target["RBI2"],
+    }
 }
-st.json(export_payload, expanded=False)
 st.download_button(
-    "⬇️ Download Weights JSON",
+    "⬇️ Download Best Weights (JSON)",
     data=json.dumps(export_payload, indent=2),
     file_name="offline_tuner_best_weights.json",
-    mime="application/json"
+    mime="application/json",
 )
 
-st.caption("Streamlit Cloud safe: fixed K=30, 5 folds, early stopping, automatic tuners, and no plots.")
+st.caption("Exported weights can be plugged into your main prediction app: use the per-target overlay exponents and blend weights to compute final ranked probabilities.")
