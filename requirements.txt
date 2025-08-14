@@ -2,7 +2,14 @@ streamlit
 pandas
 numpy
 scikit-learn
-scipy
-pyarrow
-fastparquet
 xgboost
+lightgbm
+catboost
+matplotlib
+shap
+betacal
+psutil
+python-dateutil
+pyarrow    # optional but preferred if it installs
+fastparquet  # optional
+duckdb      # robust Parquet fallback
