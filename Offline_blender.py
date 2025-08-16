@@ -1,8 +1,9 @@
 # offline_tuner.py
 # ============================================================
-# 🧪 MLB HR Offline Tuner (No-TODAY, No-Weather) — Cloud Speed (stability-patched)
-# - Same modeling & tuning logic you had
-# - Only changes: dtype fixes, robust merge (string keys), and aggressive memory cleanup per seed/fold
+# 🧪 MLB HR Offline Tuner (No-TODAY, No-Weather) — Cloud Stability
+# - Same logic/hypers as your last version; only stability guards added
+# - Robust merges (string keys), aggressive cleanup, NumPy training matrices
+# - Try/except per learner so a single failure won't kill the run
 # - Progress bars + ETA; fixed 5 folds; no plots
 # ============================================================
 
@@ -12,7 +13,7 @@ os.environ["OMP_NUM_THREADS"] = "2"  # avoid oversubscription on Streamlit Cloud
 import streamlit as st
 import pandas as pd
 import numpy as np
-import gc, time, json
+import gc, time, json, psutil
 from datetime import timedelta
 
 from sklearn.metrics import roc_auc_score, log_loss
@@ -27,18 +28,18 @@ import catboost as cb
 from scipy.special import logit, expit
 
 # -------------------- Cloud-speed constants (no toggles) --------------------
-SEEDS = [42]               # single bag for speed (unchanged from your last version)
+SEEDS = [42]               # single bag for speed
 N_FOLDS = 5                # fixed
 TOPK = 30                  # evaluate Hits@30, NDCG@30
 N_JOBS = 2                 # play nice with Streamlit Cloud
 
-# Base models (your lean setup with early stop)
+# Base models (lean with early stop)
 XGB_N_EST, XGB_LR, XGB_ES = 320, 0.06, 25
 LGB_N_EST, LGB_LR, LGB_ES = 650, 0.06, 25
-CAT_ITERS, CAT_LR, CAT_ES  = 900, 0.06, 30
+CAT_ITERS, CAT_LR, CAT_ES  = 750, 0.06, 30   # (slightly lighter; stability)
 RANK_N_EST, RANK_LR, RANK_ES = 320, 0.06, 25
 
-# ---------- Defaults for tuners (unchanged) ----------
+# ---------- Defaults for tuners ----------
 DEFAULT_BLEND = dict(
     w_prob=0.30, w_overlay=0.20, w_ranker=0.20, w_rrf=0.10, w_penalty=0.20
 )
@@ -96,13 +97,6 @@ def _safe_num_df(df: pd.DataFrame) -> pd.DataFrame:
                 pass
     return df
 
-def _winsor(df, cols, lo=0.01, hi=0.99):
-    for c in cols:
-        v = pd.to_numeric(df[c], errors="coerce")
-        ql, qh = v.quantile(lo), v.quantile(hi)
-        df[c] = v.clip(lower=ql, upper=qh)
-    return df
-
 def zscore(a):
     a = np.asarray(a, dtype=np.float64)
     mu = np.nanmean(a); sd = np.nanstd(a) + 1e-9
@@ -145,20 +139,24 @@ def tune_temperature_for_topk(p_oof, y, K=TOPK, T_grid=np.linspace(0.8, 1.6, 17)
 def _to_key_str(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower()
 
+def _mem_str():
+    vm = psutil.virtual_memory()
+    return f"{vm.percent}% used ({vm.used/1e9:.1f}GB/{vm.total/1e9:.1f}GB)"
+
 # ---------- Load ----------
 with st.spinner("Loading files..."):
     ev  = _read_any(ev_file)
     bat = _read_any(bat_file)
     pit = _read_any(pit_file)
 
-# IMPORTANT: actually apply the dtype cleaner to each DF (bug fix)
+# apply dtype cleaner
 ev  = _safe_num_df(ev)
 bat = _safe_num_df(bat)
 pit = _safe_num_df(pit)
 
 st.write(f"Event rows: {len(ev):,} | Batter rows: {len(bat):,} | Pitcher rows: {len(pit):,}")
 
-# ---------- Join Keys (UI, unchanged UX) ----------
+# ---------- Join Keys ----------
 st.subheader("🔗 Join Keys")
 ev_batter_key = st.selectbox(
     "Event → Batter key",
@@ -174,7 +172,7 @@ ev_pitcher_key = st.selectbox(
 )
 pit_key = st.selectbox("Pitcher profile key", options=pit.columns, index=0)
 
-# ---------- Robust merge like the prediction app (string keys on BOTH sides) ----------
+# ---------- Robust merge (string keys on BOTH sides) ----------
 with st.spinner("Merging profiles into event-level…"):
     ev = ev.copy()
     ev["bat_key_merge"] = _to_key_str(ev[ev_batter_key])
@@ -195,7 +193,7 @@ with st.spinner("Merging profiles into event-level…"):
     ev = ev.merge(bat_pref, on="bat_key_merge", how="left")
     ev = ev.merge(pit_pref, on="pit_key_merge", how="left")
 
-st.success("✅ Merged profiles.")
+st.success("✅ Profiles merged.")
 
 # ---------- Basic feature prep ----------
 target_col = "hr_outcome"
@@ -203,7 +201,6 @@ if target_col not in ev.columns:
     st.error("Event-level file must contain hr_outcome (0/1).")
     st.stop()
 
-# Avoid obvious leakage (unchanged list)
 LEAK = {
     "post_away_score","post_home_score","post_bat_score","post_fld_score",
     "delta_home_win_exp","delta_run_exp","delta_pitcher_run_exp",
@@ -223,14 +220,14 @@ else:
 
 # select numeric features
 num_cols = ev.select_dtypes(include=[np.number]).columns.tolist()
-X_base = ev[num_cols].copy()
-X_base = X_base.replace([np.inf, -np.inf], np.nan).fillna(-1.0).astype(np.float32)
+X_base_df = ev[num_cols].copy()
+X_base_df = X_base_df.replace([np.inf, -np.inf], np.nan).fillna(-1.0).astype(np.float32)
 
 # ---------- Folds ----------
 st.subheader("⚙️ Training (5 folds, cloud-lean)")
 folds = embargo_time_splits(dates, n_splits=N_FOLDS, embargo_days=1)
 
-# ---------- Train base models (progress + ETA) ----------
+# ---------- Train base models (progress + ETA + stability) ----------
 P_xgb_oof = np.zeros(len(y), dtype=np.float32)
 P_lgb_oof = np.zeros(len(y), dtype=np.float32)
 P_cat_oof = np.zeros(len(y), dtype=np.float32)
@@ -242,58 +239,73 @@ status = st.empty()
 t0_all = time.time()
 
 for fi, (tr_idx, va_idx) in enumerate(folds):
-    X_tr, X_va = X_base.iloc[tr_idx], X_base.iloc[va_idx]
-    y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+    # Convert to NumPy right here to avoid DF refs sticking around
+    X_tr_np = X_base_df.iloc[tr_idx].to_numpy(copy=False)
+    X_va_np = X_base_df.iloc[va_idx].to_numpy(copy=False)
+    y_tr = y.iloc[tr_idx].to_numpy()
+    y_va = y.iloc[va_idx].to_numpy()
 
-    preds_xgb, preds_lgb, preds_cat = [], [], []
+    fold_preds_xgb, fold_preds_lgb, fold_preds_cat = [], [], []
 
     for sd in SEEDS:
-        spw = max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum()))
+        spw = float(max(1.0, (len(y_tr) - y_tr.sum()) / max(1.0, y_tr.sum())))
 
-        xgb_clf = xgb.XGBClassifier(
-            n_estimators=XGB_N_EST, max_depth=6, learning_rate=XGB_LR,
-            subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
-            eval_metric="logloss", tree_method="hist",
-            scale_pos_weight=spw, early_stopping_rounds=XGB_ES,
-            n_jobs=N_JOBS, verbosity=0, random_state=sd
-        )
-        lgb_clf = lgb.LGBMClassifier(
-            n_estimators=LGB_N_EST, learning_rate=LGB_LR, max_depth=-1, num_leaves=63,
-            feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-            reg_lambda=2.0, is_unbalance=True, n_jobs=N_JOBS, random_state=sd
-        )
-        cat_clf = cb.CatBoostClassifier(
-            iterations=CAT_ITERS, depth=6, learning_rate=CAT_LR, l2_leaf_reg=6.0,
-            loss_function="Logloss", eval_metric="Logloss",
-            class_weights=[1.0, spw], od_type="Iter", od_wait=CAT_ES,
-            verbose=0, thread_count=N_JOBS, random_seed=sd,
-            allow_writing_files=False   # <<< stability on Streamlit Cloud
-        )
-
-        # Train
-        xgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-        lgb_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
-                    callbacks=[lgb.early_stopping(LGB_ES), lgb.log_evaluation(0)])
-        cat_clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-
-        # Predict
-        preds_xgb.append(xgb_clf.predict_proba(X_va)[:,1])
-        preds_lgb.append(lgb_clf.predict_proba(X_va)[:,1])
-        preds_cat.append(cat_clf.predict_proba(X_va)[:,1])
-
-        # ---- aggressive cleanup per seed ----
+        # ---- XGB (guarded) ----
         try:
-            del xgb_clf
-        except: pass
-        try:
-            del lgb_clf
-        except: pass
-        try:
-            del cat_clf
-        except: pass
-        gc.collect()
+            xgb_clf = xgb.XGBClassifier(
+                n_estimators=XGB_N_EST, max_depth=6, learning_rate=XGB_LR,
+                subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
+                eval_metric="logloss", tree_method="hist",
+                scale_pos_weight=spw, early_stopping_rounds=XGB_ES,
+                n_jobs=N_JOBS, verbosity=0, random_state=sd
+            )
+            xgb_clf.fit(X_tr_np, y_tr, eval_set=[(X_va_np, y_va)], verbose=False)
+            fold_preds_xgb.append(xgb_clf.predict_proba(X_va_np)[:,1])
+        except Exception as e:
+            st.warning(f"XGB failed on fold {fi+1}, seed {sd}: {e}")
+        finally:
+            try: del xgb_clf
+            except: pass
+            gc.collect()
 
-        # progress
+        # ---- LGB (guarded) ----
+        try:
+            lgb_clf = lgb.LGBMClassifier(
+                n_estimators=LGB_N_EST, learning_rate=LGB_LR, max_depth=-1, num_leaves=63,
+                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+                reg_lambda=2.0, is_unbalance=True, n_jobs=N_JOBS, random_state=sd
+            )
+            lgb_clf.fit(
+                X_tr_np, y_tr, eval_set=[(X_va_np, y_va)],
+                callbacks=[lgb.early_stopping(LGB_ES), lgb.log_evaluation(0)]
+            )
+            fold_preds_lgb.append(lgb_clf.predict_proba(X_va_np)[:,1])
+        except Exception as e:
+            st.warning(f"LGB failed on fold {fi+1}, seed {sd}: {e}")
+        finally:
+            try: del lgb_clf
+            except: pass
+            gc.collect()
+
+        # ---- CatBoost (guarded) ----
+        try:
+            cat_clf = cb.CatBoostClassifier(
+                iterations=CAT_ITERS, depth=6, learning_rate=CAT_LR, l2_leaf_reg=6.0,
+                loss_function="Logloss", eval_metric="Logloss",
+                class_weights=[1.0, spw], od_type="Iter", od_wait=CAT_ES,
+                verbose=0, thread_count=N_JOBS, random_seed=sd,
+                allow_writing_files=False
+            )
+            cat_clf.fit(X_tr_np, y_tr, eval_set=(X_va_np, y_va), verbose=False)
+            fold_preds_cat.append(cat_clf.predict_proba(X_va_np)[:,1])
+        except Exception as e:
+            st.warning(f"CatBoost failed on fold {fi+1}, seed {sd}: {e}")
+        finally:
+            try: del cat_clf
+            except: pass
+            gc.collect()
+
+        # progress heartbeat
         step += 1
         elapsed = time.time() - t0_all
         pct = int(100 * step / max(1, total_steps))
@@ -303,21 +315,28 @@ for fi, (tr_idx, va_idx) in enumerate(folds):
         status.write(
             f"Training base models: {step}/{total_steps} • "
             f"Elapsed: {timedelta(seconds=int(elapsed))} • "
-            f"ETA: {timedelta(seconds=int(eta))} • fold {fi+1}/{len(folds)}, seed {sd}"
+            f"ETA: {timedelta(seconds=int(eta))} • "
+            f"fold {fi+1}/{len(folds)} • mem: {_mem_str()}"
         )
 
-    # assign OOF
-    P_xgb_oof[va_idx] = np.mean(preds_xgb, axis=0)
-    P_lgb_oof[va_idx] = np.mean(preds_lgb, axis=0)
-    P_cat_oof[va_idx] = np.mean(preds_cat, axis=0)
+    # resilient averaging
+    def _safe_mean(lst, fallback_len):
+        if len(lst) == 0:
+            return np.zeros(fallback_len, dtype=np.float32)
+        return np.mean(np.vstack(lst), axis=0)
 
-    # ---- cleanup fold-level lists to avoid memory creep ----
-    del preds_xgb, preds_lgb, preds_cat, X_tr, X_va, y_tr, y_va
+    P_xgb_oof[va_idx] = _safe_mean(fold_preds_xgb, len(va_idx))
+    P_lgb_oof[va_idx] = _safe_mean(fold_preds_lgb, len(va_idx))
+    P_cat_oof[va_idx] = _safe_mean(fold_preds_cat, len(va_idx))
+
+    # ---- cleanup fold-level and yield time slice to Cloud worker ----
+    del fold_preds_xgb, fold_preds_lgb, fold_preds_cat, X_tr_np, X_va_np, y_tr, y_va
     gc.collect()
+    time.sleep(0.2)  # tiny breather helps Cloud release mem
 
 status.write("✅ Base models complete.")
 
-# ---------- Optional day-wise ranker (if dates vary) ----------
+# ---------- Day-wise ranker (optional; guarded) ----------
 st.subheader("📈 LambdaRank Head (cloud-lean)")
 has_real_days = dates.nunique() > 1
 if has_real_days:
@@ -334,27 +353,31 @@ if has_real_days:
     t0_rk = time.time()
 
     for fi, (tr_idx, va_idx) in enumerate(folds):
-        X_tr, X_va = X_base.iloc[tr_idx], X_base.iloc[va_idx]
-        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+        X_tr_np = X_base_df.iloc[tr_idx].to_numpy(copy=False)
+        X_va_np = X_base_df.iloc[va_idx].to_numpy(copy=False)
+        y_tr = y.iloc[tr_idx].to_numpy()
+        y_va = y.iloc[va_idx].to_numpy()
         d_tr, d_va = days.iloc[tr_idx], days.iloc[va_idx]
         g_tr, g_va = _groups_from_days(d_tr), _groups_from_days(d_va)
 
-        rk = lgb.LGBMRanker(
-            objective="lambdarank", metric="ndcg",
-            n_estimators=RANK_N_EST, learning_rate=RANK_LR, num_leaves=63,
-            feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-            random_state=fi
-        )
-        rk.fit(X_tr, y_tr, group=g_tr, eval_set=[(X_va, y_va)], eval_group=[g_va],
-               callbacks=[lgb.early_stopping(RANK_ES), lgb.log_evaluation(0)])
-        ranker_oof[va_idx] = rk.predict(X_va)
-
-        # fold cleanup
         try:
-            del rk
-        except: pass
-        del X_tr, X_va, y_tr, y_va, d_tr, d_va, g_tr, g_va
-        gc.collect()
+            rk = lgb.LGBMRanker(
+                objective="lambdarank", metric="ndcg",
+                n_estimators=RANK_N_EST, learning_rate=RANK_LR, num_leaves=63,
+                feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+                random_state=fi
+            )
+            rk.fit(X_tr_np, y_tr, group=g_tr, eval_set=[(X_va_np, y_va)], eval_group=[g_va],
+                   callbacks=[lgb.early_stopping(RANK_ES), lgb.log_evaluation(0)])
+            ranker_oof[va_idx] = rk.predict(X_va_np)
+        except Exception as e:
+            st.warning(f"Ranker failed on fold {fi+1}: {e}")
+        finally:
+            try: del rk
+            except: pass
+            del X_tr_np, X_va_np, y_tr, y_va, d_tr, d_va, g_tr, g_va
+            gc.collect()
+            time.sleep(0.1)
 
         step_rk += 1
         elapsed = time.time() - t0_rk
@@ -365,7 +388,7 @@ if has_real_days:
         status_rk.write(
             f"Training ranker: {step_rk}/{total_steps_rk} • "
             f"Elapsed: {timedelta(seconds=int(elapsed))} • "
-            f"ETA: {timedelta(seconds=int(eta))}"
+            f"ETA: {timedelta(seconds=int(eta))} • mem: {_mem_str()}"
         )
 
     st.success("✅ Ranker trained.")
@@ -373,11 +396,9 @@ else:
     ranker_oof = np.zeros(len(y), dtype=np.float32)
     st.info("Only one unique day found — skipping LambdaRank head.")
 
-# ---------- Meta stacker + calibration (unchanged) ----------
+# ---------- Meta stacker + calibration ----------
 st.subheader("🧮 Meta Stacker + Calibration")
 X_meta = np.column_stack([P_xgb_oof, P_lgb_oof, P_cat_oof]).astype(np.float32)
-
-# release base OOF arrays not needed anymore? (keep for disagreement calc later)
 scaler_meta = StandardScaler()
 X_meta_s = scaler_meta.fit_transform(X_meta)
 meta = LogisticRegression(max_iter=1000, solver="lbfgs")
@@ -500,11 +521,10 @@ def _ndcg_at_k(y_true, s, K):
 use_mult = st.session_state.saved_best_mult.copy()
 
 rng = np.random.default_rng(123)
-samples = 3000  # cloud-lean
+samples = 3000
 best_key = None; best_res = None
 
 pbar_m = st.progress(0)
-t0_m = time.time()
 for i in range(samples):
     a_b = float(rng.uniform(0.2, 1.6))
     b_p = float(rng.uniform(0.2, 1.6))
@@ -527,7 +547,7 @@ for i in range(samples):
 if best_res:
     st.session_state.saved_best_mult = {k:best_res[k] for k in ["a_batter","b_pitcher","c_platoon","d_park"]}
     use_mult = st.session_state.saved_best_mult.copy()
-    st.success(f"New overlay exponents found: {json.dumps(use_mult)} | Hits@{TOPK}={best_res['HitsAtK']} NDCG@30={best_res['NDCG30']:.4f}")
+    st.success(f"New overlay exponents: {json.dumps(use_mult)} | Hits@{TOPK}={best_res['HitsAtK']} NDCG@30={best_res['NDCG30']:.4f}")
 
 overlay = overlay_from_exponents(use_mult["a_batter"], use_mult["b_pitcher"], use_mult["c_platoon"], use_mult["d_park"])
 log_overlay = np.log(overlay + 1e-9)
@@ -539,6 +559,10 @@ def _rank_desc(x):
 
 disagree_std = np.std(np.vstack([P_xgb_oof, P_lgb_oof, P_cat_oof]), axis=0)
 dis_penalty = np.clip(zscore(disagree_std), 0, 3)
+
+# In case ranker failed entirely:
+if 'ranker_oof' not in locals():
+    ranker_oof = np.zeros(len(y), dtype=np.float32)
 
 r_prob   = _rank_desc(p_base)
 r_ranker = _rank_desc(zscore(ranker_oof))
@@ -557,7 +581,7 @@ def blend_with_weights(wp, wo, wr, wrrf, wpen, logit_p, log_overlay, ranker_z, r
 use_blend = st.session_state.saved_best_blend.copy()
 
 rng = np.random.default_rng(777)
-samples = 6000  # cloud-lean
+samples = 6000
 best_tuple = None; best_row = None
 pbar_b = st.progress(0)
 for i in range(samples):
@@ -606,7 +630,7 @@ with col2:
 export_payload = {
     "multiplier_exponents": st.session_state.saved_best_mult,
     "blend_weights": st.session_state.saved_best_blend,
-    "notes": "Weather-free overlay exponents + final blend weights from offline tuner (cloud-lean, stability patched)."
+    "notes": "Weather-free overlay exponents + final blend weights from offline tuner (cloud stability)."
 }
 st.download_button(
     "⬇️ Download Weights JSON",
