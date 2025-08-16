@@ -31,7 +31,7 @@ from scipy.special import logit, expit
 SEEDS = [42]               # single bag for speed
 N_FOLDS = 5                # fixed
 TOPK = 30                  # evaluate Hits@30, NDCG@30
-N_JOBS = 2                 # play nice with Streamlit Cloud
+N_JOBS = 1                 # play nice with Streamlit Cloud
 
 # Base models (lean with early stop)
 XGB_N_EST, XGB_LR, XGB_ES = 320, 0.06, 25
